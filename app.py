@@ -130,51 +130,72 @@ def prepare_product(img):
     Mc.paste(Mm, (px, py))
     return canvas.resize((SIZE, SIZE), Image.LANCZOS), Mc.resize((SIZE, SIZE), Image.LANCZOS)
 
-def detect_surface_y(bg_img, expected_bottom_y, x_center, x_width, search_range=140, edge_threshold=8.0):
+def detect_surface_y(bg_img, expected_bottom_y, x_center, x_width, edge_threshold=8.0):
+    # Find the wall->surface seam (the horizontal horizon) across the product's
+    # horizontal footprint, then return the surface line the product base should
+    # rest on -- i.e. a few pixels below that seam, on top of the counter.
     arr = np.array(bg_img.convert("L")).astype(np.float32)
     h, w = arr.shape
     half = max(x_width // 2, 150)
     c0, c1 = max(0, int(x_center - half)), min(w, int(x_center + half))
     grad = np.abs(arr[:-1, c0:c1] - arr[1:, c0:c1])
     grad = np.vstack([grad, np.zeros((1, c1 - c0))])
-    row_strength = grad.mean(axis=1)
-    smooth = ndimage.gaussian_filter1d(row_strength, sigma=2.5)
-    start = max(0, expected_bottom_y - search_range)
-    end = min(h, expected_bottom_y + search_range)
-    window = smooth[start:end]
+    row_strength = ndimage.gaussian_filter1d(grad.mean(axis=1), sigma=2.5)
+    # The seam sits in the lower-middle of the frame (prompts frame the surface as
+    # filling the bottom third). Scan that whole band instead of a narrow window
+    # around expected_bottom, which often excluded the true seam and left the
+    # product floating above the counter.
+    search_lo = int(h * 0.40)
+    search_hi = int(h * 0.92)
+    window = row_strength[search_lo:search_hi]
     if window.max() < edge_threshold:
         return expected_bottom_y
     peaks, props = find_peaks(window, distance=25, prominence=window.max() * 0.12)
     if len(peaks) == 0:
         return expected_bottom_y
-    peak_ys = start + peaks
+    peak_ys = search_lo + peaks
     distances = np.abs(peak_ys - expected_bottom_y)
     scores = props["prominences"] * np.exp(-distances / 80.0)
-    best_y = int(peak_ys[np.argmax(scores)])
-    return best_y if abs(best_y - expected_bottom_y) <= 180 else expected_bottom_y
+    horizon = int(peak_ys[np.argmax(scores)])
+    # The product stands ON the surface: the seam is the back of the counter, so
+    # drop slightly below it so the base kisses the surface rather than the seam.
+    surface_y = horizon + max(6, int(h * 0.012))
+    return surface_y
 
 def add_grounding(img, product, alpha, x, y, s):
     img = img.convert("RGBA")
+    alpha_arr = np.array(alpha).astype(np.float32) / 255.0
+    # --- contact shadow from the product BASE only ---
+    # Project the bottom footprint down onto the surface as a thin, soft ellipse
+    # instead of shadowing the whole product body.
+    base_h = max(8, int(s * 0.12))
+    base_mask = alpha_arr[-base_h:, :]
+    foot = (base_mask > 0.05).any(axis=0).astype(np.float32)
+    foot = ndimage.gaussian_filter1d(foot, sigma=max(2, s // 60))
+    shadow_h = max(14, s // 14)
+    sh = np.zeros((shadow_h, s), np.float32)
+    for r in range(shadow_h):
+        fade = np.clip(1 - r / shadow_h, 0, 1) ** 1.5
+        sh[r, :] = foot * fade
+    sh = ndimage.gaussian_filter(sh, sigma=(max(2, shadow_h // 4), max(3, s // 40)))
+    sh = (np.clip(sh, 0, 1) * 0.5 * 255).astype(np.uint8)
+    sh_top = y + s - 2
+    black = Image.new("RGBA", (s, shadow_h), (10, 10, 10, 255))
+    img.paste(black, (x, sh_top), Image.fromarray(sh))
+    # --- reflection BELOW the product ---
+    # Mirror only a short band of the base and fade it out downward, placed so its
+    # top kisses the product base instead of overlapping the product body.
     refl = product.transpose(Image.FLIP_TOP_BOTTOM)
     ra = np.array(alpha.transpose(Image.FLIP_TOP_BOTTOM)).astype(np.float32) / 255.0
-    ra *= np.linspace(0.22, 0.0, s)[:, None]
+    ref_h = max(20, int(s * 0.22))
+    ra = ra[:ref_h, :]
+    refl = refl.crop((0, 0, s, ref_h))
+    ra *= np.linspace(0.20, 0.0, ref_h)[:, None]
     center = s // 2
     half_w = s // 3
     h_fade = np.clip(1 - np.abs(np.arange(s) - center) / half_w, 0, 1)
     ra *= h_fade[None, :]
-    img.paste(refl, (x, y + s - 4), Image.fromarray((ra * 255).astype(np.uint8)))
-    band = max(12, s // 7)
-    squashed = alpha.resize((s, band), Image.LANCZOS)
-    sh = Image.new("L", (s, s), 0); sh.paste(squashed, (0, s - band))
-    sh = sh.filter(ImageFilter.GaussianBlur(max(3, s // 30)))
-    sh_arr = np.array(sh).astype(np.float32) / 255.0
-    sh_center = s // 2
-    sh_half = int(s // 1.8)
-    sh_fade = np.clip(1 - np.abs(np.arange(s) - sh_center) / sh_half, 0.3, 1)
-    sh_arr *= sh_fade[None, :]
-    sh_arr = (sh_arr * 0.55 * 255).astype(np.uint8)
-    black = Image.new("RGBA", (s, s), (10, 10, 10, 255))
-    img.paste(black, (x, y + 2), Image.fromarray(sh_arr))
+    img.paste(refl, (x, y + s - 2), Image.fromarray((ra * 255).astype(np.uint8)))
     return img
 
 def make_font(font_file, size):
