@@ -3,7 +3,6 @@ import requests, numpy as np, gradio as gr
 import PIL.Image as Image
 import PIL.ImageDraw as ImageDraw
 import PIL.ImageFont as ImageFont
-import PIL.ImageFilter as ImageFilter
 from PIL import ImageColor
 from rembg import remove, new_session
 from scipy import ndimage
@@ -14,45 +13,6 @@ W, H, SIZE = 896, 1152, 704
 os.makedirs("identity_pack", exist_ok=True)
 os.makedirs("brand_kit", exist_ok=True)
 
-SCENES = {
- "Kitchen":  ("empty luxury product photography background, modern kitchen counter made of {surface}, {light}, {styling}, shallow depth of field, professional commercial photograph, horizontal counter surface filling the bottom third of the frame, sharp edge where wall meets counter, camera at counter level, no product",
-              "professional product photography, {p} standing upright on a kitchen counter, soft natural contact shadow beneath the product, subtle reflection on the surface, photorealistic, high detail"),
- "Bathroom": ("empty luxury bathroom vanity with a {surface} top, {light}, {styling}, elegant minimal background, professional cosmetics photography, horizontal vanity surface filling the bottom third of the frame, sharp edge where wall meets surface, camera at counter level, no product",
-              "professional product photography, {p} standing upright on a bathroom vanity, soft contact shadow, subtle reflection, spa atmosphere, photorealistic, high detail"),
- "Studio":   ("empty seamless studio backdrop in {backdrop}, {light}, professional studio product photography, glossy reflective floor surface filling the bottom third of the frame, clean horizon line, camera at floor level, no product",
-              "professional studio product photography, {p} standing upright on a glossy studio surface, soft contact shadow, clean reflection, photorealistic, high detail"),
- "Luxury":   ("empty luxury still life set, {surface}, {light}, {styling}, high-end commercial product photography, elegant minimal composition, horizontal surface filling the bottom third of the frame, sharp edge where backdrop meets surface, camera at surface level, no product",
-              "luxury product photography, {p} standing upright on an elegant surface, warm soft shadow, refined reflection, photorealistic, high detail"),
- "Outdoor":  ("empty outdoor setting, {surface}, {light}, {backdrop}, natural lifestyle product photography, horizontal table surface filling the bottom third of the frame, clear separation between ground and surface, camera at table level, no product",
-              "lifestyle product photography, {p} standing upright on an outdoor surface, soft natural shadow, gentle reflection, photorealistic, high detail"),
-}
-
-VARIANTS = {
- "Kitchen": {
-  "surface": ["white marble", "walnut wood", "black granite", "beige quartz"],
-  "light": ["soft morning window light", "warm golden hour glow", "bright airy daylight", "moody dusk light"],
-  "styling": ["a ceramic bowl of lemons nearby", "fresh herbs in a glass vase", "stacked ceramic dishes in the background", "copper cookware blurred behind"],
- },
- "Bathroom": {
-  "surface": ["white marble", "beige travertine", "pale oak wood"],
-  "light": ["soft diffused spa lighting", "warm candlelit glow", "bright daylight"],
-  "styling": ["rolled white towels", "eucalyptus branches", "lit candles", "a white orchid"],
- },
- "Studio": {
-  "backdrop": ["a soft gray gradient", "a warm beige gradient", "a deep charcoal gradient", "a muted sage gradient"],
-  "light": ["dramatic rim lighting", "soft diffused lighting", "hard editorial lighting"],
- },
- "Luxury": {
-  "surface": ["draped beige silk", "champagne satin", "black glass", "cream stone"],
-  "light": ["warm premium lighting", "soft candlelight", "a golden spotlight"],
-  "styling": ["subtle gold accents", "a strand of pearls", "a silk ribbon", "dried pampas grass"],
- },
- "Outdoor": {
-  "surface": ["a weathered stone table", "a rustic wooden table", "a flat mossy rock"],
-  "light": ["golden hour sunlight", "soft overcast light", "dappled tree shade"],
-  "backdrop": ["a blurred garden", "forest bokeh", "a lavender field"],
- },
-}
 NEG = "floating product, missing shadow, text, watermark, person, hand, clutter, low quality, blurry, distorted, bad lighting, cork, stopper, apothecary bottle, bottle inside a bottle, extra glass container, mutated product, changed product shape"
 
 COLOR_NAMES = [("white",(255,255,255)),("black",(25,25,25)),("gray",(128,128,128)),("cream",(245,239,230)),
@@ -130,33 +90,39 @@ def prepare_product(img):
     Mc.paste(Mm, (px, py))
     return canvas.resize((SIZE, SIZE), Image.LANCZOS), Mc.resize((SIZE, SIZE), Image.LANCZOS)
 
-def detect_surface_y(bg_img, expected_bottom_y, x_center, x_width, edge_threshold=8.0):
+def detect_surface_y(bg_img, expected_bottom_y, x_center, x_width, edge_threshold=6.0):
     # Find the wall->surface seam (the horizontal horizon) across the product's
     # horizontal footprint, then return the surface line the product base should
-    # rest on -- i.e. a few pixels below that seam, on top of the counter.
+    # rest on -- a few pixels below that seam, on top of the counter.
     arr = np.array(bg_img.convert("L")).astype(np.float32)
     h, w = arr.shape
     half = max(x_width // 2, 150)
     c0, c1 = max(0, int(x_center - half)), min(w, int(x_center + half))
-    grad = np.abs(arr[:-1, c0:c1] - arr[1:, c0:c1])
+    col = arr[:, c0:c1]
+    grad = np.abs(col[:-1] - col[1:])
     grad = np.vstack([grad, np.zeros((1, c1 - c0))])
-    row_strength = ndimage.gaussian_filter1d(grad.mean(axis=1), sigma=2.5)
-    # The seam sits in the lower-middle of the frame (prompts frame the surface as
-    # filling the bottom third). Scan that whole band instead of a narrow window
-    # around expected_bottom, which often excluded the true seam and left the
-    # product floating above the counter.
+    row_strength = ndimage.gaussian_filter1d(grad.mean(axis=1), sigma=3.0)
+    # Also measure per-row brightness change vs the top of the frame, so gradual
+    # wall->surface transitions (no hard edge) are still caught.
+    top_ref = ndimage.gaussian_filter1d(col[:max(1, h // 8)].mean(axis=0), sigma=4).mean()
+    bright_diff = np.abs(ndimage.gaussian_filter1d(col.mean(axis=1), sigma=4) - top_ref)
+    combined = row_strength + bright_diff * 0.5
+    # The seam sits in the lower-middle of the frame. Scan that whole band instead
+    # of a narrow window around expected_bottom, which often excluded the true seam
+    # and left the product floating above the counter.
     search_lo = int(h * 0.40)
-    search_hi = int(h * 0.92)
-    window = row_strength[search_lo:search_hi]
+    search_hi = int(h * 0.94)
+    window = combined[search_lo:search_hi]
     if window.max() < edge_threshold:
         return expected_bottom_y
-    peaks, props = find_peaks(window, distance=25, prominence=window.max() * 0.12)
+    peaks, props = find_peaks(window, distance=30, prominence=max(1.0, window.max() * 0.10))
     if len(peaks) == 0:
-        return expected_bottom_y
-    peak_ys = search_lo + peaks
-    distances = np.abs(peak_ys - expected_bottom_y)
-    scores = props["prominences"] * np.exp(-distances / 80.0)
-    horizon = int(peak_ys[np.argmax(scores)])
+        horizon = search_lo + int(np.argmax(window))
+    else:
+        peak_ys = search_lo + peaks
+        distances = np.abs(peak_ys - expected_bottom_y)
+        scores = props["prominences"] * np.exp(-distances / 90.0)
+        horizon = int(peak_ys[np.argmax(scores)])
     # The product stands ON the surface: the seam is the back of the counter, so
     # drop slightly below it so the base kisses the surface rather than the seam.
     surface_y = horizon + max(6, int(h * 0.012))
@@ -233,10 +199,10 @@ def build_card(product, alpha, pal, logo, tagline, font_file):
         if lg: card.paste(lg, ((W-lg.width)//2, 40), lg)
     return card.convert("RGB")
 
-def _render(main, a2, a3, a4, a5, desc, scene, size_pct, height_pct, harmonize,
+def _render(main, a2, a3, a4, a5, desc, scene_prompt, size_pct, height_pct, harmonize,
             use_brand, logo, c_primary, c_secondary, c_accent, c_bg, c_text,
             font_file, tagline, extra_assets, brand_card,
-            use_custom, custom_pos, custom_neg, auto_place, contact_denoise):
+            neg_prompt, auto_place, contact_denoise):
     if main is None: raise ValueError("Upload a product photo first.")
     for i, ang in enumerate([a2, a3, a4, a5], 2):
         if ang is not None: ang.convert("RGB").save(f"identity_pack/angle_{i}.png")
@@ -252,15 +218,15 @@ def _render(main, a2, a3, a4, a5, desc, scene, size_pct, height_pct, harmonize,
     x = (W - s) // 2
     intended_y = int((H - s) * height_pct / 100)
 
-    if use_custom and (custom_pos or "").strip():
-        p1 = custom_pos.strip()
-        p2 = p1 + ", product standing firmly on the surface, soft natural contact shadow, subtle reflection, photorealistic, high detail"
-    else:
-        p1t, p2t = SCENES[scene]
-        p1 = p1t.format(**{k: random.choice(opts) for k, opts in VARIANTS[scene].items()})
-        p2 = p2t.format(p=desc or "product")
+    scene_prompt = (scene_prompt or "").strip()
+    if not scene_prompt:
+        raise ValueError("Describe the scene you want in the Scene prompt box.")
+    # The background is generated empty; the product is composited in afterward.
+    p1 = scene_prompt + ", empty scene, no product, horizontal surface filling the bottom third of the frame, sharp edge where wall meets surface, camera at surface level"
+    prod_desc = (desc or "").strip() or "product"
+    p2 = f"{scene_prompt}, professional product photography, {prod_desc} standing upright on the surface, soft natural contact shadow, subtle reflection, photorealistic, high detail"
 
-    neg = (custom_neg or "").strip() if use_custom and (custom_neg or "").strip() else NEG
+    neg = (neg_prompt or "").strip() or NEG
     if use_brand:
         p1 += f", elegant color palette of {cname(c_primary)}, {cname(c_secondary)} and {cname(c_accent)}, props and lighting matching these tones"
 
@@ -333,24 +299,10 @@ def generate(*args):
     except Exception as e:
         return [], f"Error: {e}  (Is ComfyUI Desktop running?)"
 
-def generate_all(main, a2, a3, a4, a5, desc, scene_ignored, size_pct, height_pct, harmonize,
-                 use_brand, logo, c_primary, c_secondary, c_accent, c_bg, c_text,
-                 font_file, tagline, extra_assets, brand_card,
-                 use_custom, custom_pos, custom_neg, auto_place, contact_denoise):
-    try:
-        out = []
-        for sc in SCENES:
-            print(f"🎬 Rendering scene: {sc}")
-            out += _render(main, a2, a3, a4, a5, desc, sc, size_pct, height_pct, harmonize,
-                           use_brand, logo, c_primary, c_secondary, c_accent, c_bg, c_text,
-                           font_file, tagline, extra_assets, False,
-                           False, "", "", auto_place, contact_denoise)
-        return out, f"Asset pack done ✅ {len(out)} images"
-    except Exception as e:
-        return [], f"Error: {e}  (Is ComfyUI Desktop running?)"
 
-with gr.Blocks(title="Mockup Factory v1.2") as ui:
-    gr.Markdown("# 🏭 Mockup Factory — v1.2 (Bulletproof + Debug)")
+with gr.Blocks(title="Mockup Factory v1.3") as ui:
+    gr.Markdown("# 🏭 Mockup Factory — v1.3")
+    gr.Markdown("Upload a product photo, describe the scene you want, and generate.")
     with gr.Row():
         with gr.Column():
             main = gr.Image(type="pil", label="Product photo (raw, any background)")
@@ -360,9 +312,11 @@ with gr.Blocks(title="Mockup Factory v1.2") as ui:
             with gr.Row():
                 a4 = gr.Image(type="pil", label="Angle 4 (optional)")
                 a5 = gr.Image(type="pil", label="Angle 5 (optional)")
-            desc   = gr.Textbox(label="Product description", value="lavender transparent pump bottle with a sage green pump")
-            scene  = gr.Dropdown(list(SCENES), value="Kitchen", label="Scene")
-            size_pct   = gr.Slider(50, 100, value=100, label="Product size")
+            desc        = gr.Textbox(label="Product description", value="lavender transparent pump bottle with a sage green pump")
+            scene_prompt = gr.Textbox(label="Scene prompt (describe the scene you want)", lines=3, value="modern kitchen counter made of white marble, soft morning window light, a ceramic bowl of lemons nearby")
+            with gr.Accordion("Negative prompt (optional)", open=False):
+                neg_prompt = gr.Textbox(label="Negative prompt", lines=2, value="")
+            size_pct   = gr.Slider(30, 75, value=55, label="Product size")
             height_pct = gr.Slider(10, 70, value=45, label="Vertical position")
             auto_place = gr.Checkbox(label="Auto-detect surface (anti-float)", value=True)
             harmonize  = gr.Checkbox(label="AI harmonize pass (light-matching only)", value=False)
@@ -381,20 +335,14 @@ with gr.Blocks(title="Mockup Factory v1.2") as ui:
                 tagline = gr.Textbox(label="Tagline", value="")
                 extra_assets = gr.File(label="Other brand assets", file_count="multiple")
                 brand_card = gr.Checkbox(label="Also generate flat brand-color ad card", value=True)
-            with gr.Accordion("Advanced: custom prompts (Pro Mode)", open=False):
-                use_custom = gr.Checkbox(label="Use my own prompts instead of the scene preset")
-                custom_pos = gr.Textbox(label="Positive prompt", lines=3)
-                custom_neg = gr.Textbox(label="Negative prompt", lines=2)
             btn = gr.Button("GENERATE 🚀", variant="primary")
-            btn_all = gr.Button("GENERATE ALL SCENES 🎬  (asset pack)", variant="secondary")
         with gr.Column():
             out_img = gr.Gallery(label="Results", columns=1, object_fit="contain", height=900)
             status  = gr.Textbox(label="Status")
-    INPUTS = [main, a2, a3, a4, a5, desc, scene, size_pct, height_pct, harmonize,
+    INPUTS = [main, a2, a3, a4, a5, desc, scene_prompt, size_pct, height_pct, harmonize,
               use_brand, logo, c_primary, c_secondary, c_accent, c_bg, c_text,
               font_file, tagline, extra_assets, brand_card,
-              use_custom, custom_pos, custom_neg, auto_place, contact_denoise]
+              neg_prompt, auto_place, contact_denoise]
     btn.click(generate, INPUTS, [out_img, status])
-    btn_all.click(generate_all, INPUTS, [out_img, status])
 
 ui.launch(inbrowser=False)
